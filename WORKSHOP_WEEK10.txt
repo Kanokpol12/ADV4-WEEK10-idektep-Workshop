@@ -1,0 +1,362 @@
+import time, cv2, serial, logging, math
+import numpy as np
+from logging import info, error
+from coloredlogs import install 
+
+# ======================================
+# [0] SETUP & LOGGING
+# ======================================
+log_format = "%(asctime)s - %(hostname)s:%(username)s:%(programname)s - %(levelname)s: %(message)s"
+install(level="info", format=log_format)
+logging.basicConfig(level=logging.INFO)
+
+# ======================================
+# [1] CONFIGURATIONS & TRAY SETUP
+# ======================================
+# --- 1.1 Robot & Camera Offsets ---
+y_fix = 30
+X_OFFSET = 0    # (mm) ระยะห่างแกน X ระหว่างกล้องกับมือจับ
+Y_OFFSET = 128 - y_fix  # (mm) ระยะห่างแกน Y ระหว่างกล้องกับมือจับ
+
+# --- 1.2 Tray Grid Configuration (ตั้งค่าถาดหลุม) ---
+# *** สำคัญ: ต้องวัดค่าจริงของถาดมาใส่ตรงนี้ ***
+TRAY_ROWS = 3                   # จำนวนแถว
+TRAY_COLS = 5                   # จำนวนคอลัมน์
+START_X_POS = 53.0              # พิกัด Robot X ของหลุมซ้ายบนสุด
+START_Y_POS = 155.0             # พิกัด Robot Y ของหลุมซ้ายบนสุด
+PITCH_X = -27.0                 # ระยะห่างระหว่างหลุมแกน X (ถ้าไปทางซ้ายให้ติดลบ)
+PITCH_Y = -27.0                 # ระยะห่างระหว่างหลุมแกน Y (ถ้าลงล่างให้ติดลบ)
+
+# สร้าง Database พิกัดหลุมอัตโนมัติ (Robot Coordinates)
+TRAY_MATRIX = []
+for r in range(TRAY_ROWS):
+    for c in range(TRAY_COLS):
+        slot_x = START_X_POS + (c * PITCH_X)
+        slot_y = START_Y_POS + (r * PITCH_Y)
+        TRAY_MATRIX.append({"id": f"R{r}-C{c}", "x": slot_x, "y": slot_y})
+
+# --- 1.3 Safety Limits (ขอบเขตปลอดภัย) ---
+LIMIT_X_MIN = -55.0; LIMIT_X_MAX = 53.0
+LIMIT_Y_MIN = 101.0;  LIMIT_Y_MAX = 155.0
+
+# ======================================
+# [2] SERIAL COMMUNICATION
+# ======================================
+def init_serial():
+    """เชื่อมต่อ Serial Port"""
+    # *** เช็ค COM PORT ให้ถูกต้อง ***
+    return serial.Serial(port="COM______", baudrate=115200, timeout=1)                               ###======================================================###ADD
+
+def send_state(serial_port, data):
+    """ส่งข้อมูลไป Arduino"""
+    try:
+        command_to_send = f"{data}\n"
+        serial_port.write(command_to_send.encode('utf-8'))
+        info(f"Sent: {data}")
+    except serial.SerialException as e:
+        error(f"Error Sending data: {e}")
+
+def receive_state(serial_port):
+    """(Blocking) รอข้อความตอบกลับ (ใช้เฉพาะตอน Setup)"""
+    state_message = ["Sethome position", "Ready to detect"]
+    try:
+        while True:
+            if serial_port.in_waiting > 0:
+                line = serial_port.readline().decode('utf-8').rstrip()
+                info(f"Receive: {line}")
+                if line in state_message:
+                    break
+    except serial.SerialException as e:
+        error(f"Serial Error: {e}")
+
+# ======================================
+# [3] CALCULATION & SNAP LOGIC
+# ======================================
+def snap_to_tray_grid(robot_x, robot_y):
+    """
+    ฟังก์ชันพระเอก: ดึงพิกัดที่คำนวณได้จากกล้อง เข้าหาหลุมที่ใกล้ที่สุด
+    """
+    closest_slot = None
+    min_dist = float('inf')
+    
+    # วนลูปหาหลุมที่ใกล้ที่สุดในระยะ 20mm
+    for slot in TRAY_MATRIX:
+        dist = math.sqrt((robot_x - slot["x"])**2 + (robot_y - slot["y"])**2)
+        if dist < min_dist:
+            min_dist = dist
+            closest_slot = slot
+
+    # ถ้าเจอหลุมที่ใกล้กว่า 25mm ให้ Snap เลย
+    if closest_slot and min_dist < 25.0:
+        info(f"SNAP! Raw({robot_x:.1f},{robot_y:.1f}) -> Slot[{closest_slot['id']}] at ({closest_slot['x']:.1f}, {closest_slot['y']:.1f})")
+        return closest_slot["x"], closest_slot["y"]
+    
+    # ถ้าไม่เจอหลุมใกล้ๆ (อาจจะวางนอกถาด) ให้ใช้ค่าเดิม
+    return robot_x, robot_y
+
+def object_position_cal(frame, cx, cy, mm_per_pixel = 0.53):
+    """แปลง Pixel เป็น mm (Offset จากกลางภาพ)"""
+    h, w, c_channel = frame.shape
+    cam_center = (int(w / 2), int(h / 2))
+    
+    # คำนวณระยะห่างจากกลางภาพ
+    offset_x_pixel = cx - cam_center[0]
+    offset_y_pixel = cy - cam_center[1]
+    
+    # วาดเส้นเล็ง
+    cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+    cv2.line(frame, cam_center, (cx, cy), (255, 255, 255), 2)
+    
+    return int(offset_x_pixel * mm_per_pixel), int(offset_y_pixel * mm_per_pixel)
+
+def object_position_check(data_stream, stamp_choose, target_count=15):
+    """
+    1. เช็คความนิ่งของข้อมูล
+    2. แปลงเป็นพิกัด Robot
+    3. เข้าฟังก์ชัน SNAP เพื่อดึงเข้าหลุม
+    """
+    count, last_value = 0, None
+    for data in data_stream:
+        if data == last_value:
+            count += 1
+        else:
+            count = 1
+            last_value = data
+        
+        if count == target_count:
+            # 1. ได้ค่า Offset (mm) จากกล้อง
+            cam_offset_x = data[0]
+            cam_offset_y = data[1]
+            
+            # 2. แปลงเป็นพิกัด Robot (Raw)
+            # สูตร: พิกัดวัตถุ = พิกัดปัจจุบัน + Offset กล้อง + Offset เครื่องมือ
+            # แต่เนื่องจากเราไม่รู้พิกัดปัจจุบัน (Open loop) เราจึงส่งเป็น G-Code แบบ Relative หรือคำนวณจาก Home
+            # ในที่นี้ Code เดิมของคุณส่งค่า Offset ไปรวมกับ X_OFFSET/Y_OFFSET เลย
+            
+            raw_robot_x = cam_offset_x + X_OFFSET
+            raw_robot_y = cam_offset_y + Y_OFFSET
+            
+            # 3. *** TRAY SNAP *** (ดึงค่าเข้าหลุมที่กำหนดไว้)
+            final_x, final_y = snap_to_tray_grid(raw_robot_x, raw_robot_y)
+            
+            # 4. Safety Limit (กันชนขอบ)
+            # final_x = max(LIMIT_X_MIN, min(final_x, LIMIT_X_MAX))
+            # final_y = max(LIMIT_Y_MIN, min(final_y, LIMIT_Y_MAX))
+            
+            return f"G{stamp_choose} X{final_x:.1f} Y{final_y:.1f}"
+            
+    return None 
+
+def color_detection_choose(c_choose, frame):
+    """Mask สี (ใช้ค่า HSV จากโค้ดแรกที่หาเจอ)"""
+    frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    if c_choose in ["red", "r"]:
+        lower1 = np.array([0, 100, 100]); upper1 = np.array([10, 255, 255])
+        lower2 = np.array([160, 100, 100]); upper2 = np.array([179, 255, 255])
+        return cv2.inRange(frame_hsv, lower1, upper1) + cv2.inRange(frame_hsv, lower2, upper2)
+        
+    elif c_choose in ["blue", "b"]:                                                             ###======================================================###ADD
+        return cv2.inRange(frame_hsv, np.array([95, 67, 0]), np.array([149, 255, 255]))
+        
+    elif c_choose in ["green", "g"]:                                                            ###======================================================###ADD
+        # ค่าจากโค้ดแรกที่บอกว่าหาเจอ
+        return cv2.inRange(frame_hsv, np.array([__________]), np.array([__________])) 
+        
+    elif c_choose in ["orange", "o"]:                                                            ###======================================================###ADD
+        return cv2.inRange(frame_hsv, np.array([__________]), np.array([__________]))
+        
+    elif c_choose in ["yellow", "y"]:                                                            ###======================================================###ADD
+        return cv2.inRange(frame_hsv, np.array([__________]), np.array([__________]))
+        
+    return None
+
+def process_setup():
+    try:
+        ser = init_serial()
+        if ser.is_open:
+            info("SERIAL CONNECTED.")
+            time.sleep(2)
+            send_state(ser, "home")
+            receive_state(ser)
+            time.sleep(1)
+            send_state(ser, "ready")
+            receive_state(ser)
+            info("ROBOT READY.")
+            return ser
+    except Exception as e:
+        error(f"Setup Error: {e}")
+        return None
+
+# ======================================
+# [4] DETECTION CYCLE (Non-Blocking)
+# ======================================
+def find_and_pick_one(serial_port, cap, c_choose):
+    """
+    ฟังก์ชันค้นหาและหยิบ (แก้ไข: ลดค่า Area และเพิ่มหน้าต่างเช็คสี)
+    """
+    info(f"SEARCHING FOR: {c_choose}")
+    data_list = []
+    
+    waiting_for_robot = False
+    pick_zone_ratio = __________                                                          ###==========================================================### Ex. 0.500
+    
+    no_object_timer = 0
+    TIMEOUT_FRAMES = 20 
+    
+    # [จุดแก้ที่ 1] ลดค่าลง เพื่อให้เจอวัตถุง่ายขึ้น
+    # ลองเริ่มที่ 500 ถ้ามันเจอจุดเล็กๆ (noise) ค่อยๆ เพิ่มเป็น 800, 1000
+    MIN_OBJECT_AREA = 500 
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: 
+            error("Camera Fail"); return 'error'
+        
+        h, w, _ = frame.shape
+        pick_line_y = int(h * pick_zone_ratio)
+        
+        cv2.line(frame, (0, pick_line_y), (w, pick_line_y), (0, 255, 255), 2)
+        
+        if not waiting_for_robot:
+            mask = color_detection_choose(c_choose, frame)
+            
+            # ตัดส่วนบนออก
+            mask[0:pick_line_y, :] = 0 
+            
+            # [จุดแก้ที่ 2] โชว์หน้าต่าง Mask ขาว-ดำ เพื่อเช็คว่าเห็นสีหรือไม่?
+            # ถ้าหน้าต่างนี้มืดสนิท แสดงว่าค่า HSV ผิด
+            # ถ้าหน้าต่างนี้มีสีขาวตรงวัตถุ แต่กรอบไม่ขึ้น แสดงว่า MIN_OBJECT_AREA เยอะไป
+            cv2.imshow("DEBUG MASK (White = Found)", mask) 
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            found_valid_object = False 
+
+            if contours:
+                # เรียงลำดับเอาอันใหญ่สุดก่อน
+                c_target = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(c_target)
+
+                # วาด Contour ทั้งหมดด้วยสีแดงบางๆ เพื่อดูว่ากล้องเห็นอะไรบ้าง
+                cv2.drawContours(frame, contours, -1, (0, 0, 255), 1)
+
+                if area > MIN_OBJECT_AREA: 
+                    found_valid_object = True
+                    no_object_timer = 0 
+
+                    M = cv2.moments(c_target)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"]/M["m00"])
+                        cy = int(M["m01"]/M["m00"])
+                        
+                        data = object_position_cal(frame, cx, cy)
+                        data_list.append(data)
+                        if len(data_list) > 20: data_list.pop(0) # ลดจำนวน Buffer ลงนิดหน่อยให้ตอบสนองไวขึ้น
+                        
+                        cmd = object_position_check(data_list, stamp_choose=1, target_count=10)
+                        
+                        # แสดงผล Area บนจอ
+                        rect = cv2.boundingRect(c_target)
+                        cv2.rectangle(frame, rect, (0,255,0), 2)
+                        cv2.putText(frame, f"Area: {int(area)}", (rect[0], rect[1]-25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                        
+                        if cmd:
+                            info(f"LOCKED & SNAPPED: {cmd}")
+                            send_state(serial_port, cmd)
+                            waiting_for_robot = True 
+                            data_list = [] 
+            
+            if not found_valid_object:
+                no_object_timer += 1
+                cv2.putText(frame, f"Checking empty... {no_object_timer}/{TIMEOUT_FRAMES}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+                
+                if no_object_timer > TIMEOUT_FRAMES:
+                    # ปิดหน้าต่าง Debug ก่อนออก
+                    try: cv2.destroyWindow("DEBUG MASK (White = Found)")
+                    except: pass
+                    return 'no_object_found' 
+
+        else:
+            cv2.putText(frame, "ROBOT MOVING...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            if serial_port.in_waiting > 0:
+                line = serial_port.readline().decode('utf-8').rstrip()
+                info(f"Robot: {line}")
+                if "Sucess" in line or "Success" in line:
+                    try: cv2.destroyWindow("DEBUG MASK (White = Found)")
+                    except: pass
+                    return 'object_picked' 
+
+        cv2.imshow("Detection", frame)
+        if cv2.waitKey(1) == ord('q'):
+            return 'quit'
+# ======================================
+# [5] MAIN LOOP
+# ======================================
+def main():
+    ser = process_setup()
+    if not ser: return
+    
+    cap = cv2.VideoCapture(1) # *** ตรวจสอบ Index กล้อง ***
+    cap.set(3, 640); cap.set(4, 480)
+    
+    cv2.namedWindow("Detection")
+
+    try:
+        while True:
+            # Loop นี้เพื่อให้ภาพกล้องไม่ค้างตอนรอ Input
+            info("Waiting for input... (Type in console)")
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                cv2.putText(frame, "TYPE COLOR IN CONSOLE", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,255), 2)
+                cv2.imshow("Detection", frame)
+                if cv2.waitKey(10) == ord('q'): return
+                
+                # วิธีแก้ Hack เพื่อให้ Input ไม่ Block กล้องนานเกินไปคือ
+                # เราจะ Break ออกไปรับ Input แล้วถ้า User ยังไม่พิมพ์ มันจะวนใหม่
+                # (แต่ Python input() มัน blocking โดยธรรมชาติ วิธีนี้คือยอมหยุดภาพชั่วคราวตอนพิมพ์)
+                break 
+
+            c_input = input("\n>> Enter color (r/g/b/o/y) or 'q': ").strip().lower()          
+            if c_input == 'q': break
+            
+            # Validating color
+            valid_map = {'r':'red', 'red':'red', 'g':'green', 'green':'green', 
+                         'b':'blue', 'blue':'blue', 'o':'orange', 'orange':'orange',
+                         'y':'yellow', 'yellow':'yellow'}
+            
+            if c_input not in valid_map:
+                error("Invalid Color")
+                continue
+                
+            c_choose = valid_map[c_input]
+            
+            # --- START PICKING LOOP ---
+            # วนลูปหยิบจนกว่าจะหมด (status == 'no_object_found')
+            info(f"--- START JOB: {c_choose} ---")
+            while True:
+                status = find_and_pick_one(ser, cap, c_choose)
+                
+                if status == 'object_picked':
+                    time.sleep(1) # พักแป๊บหนึ่งก่อนหาชิ้นต่อไป
+                    continue # วนไปหาชิ้นต่อไป
+                    
+                elif status == 'no_object_found':
+                    info("Tray Cleaned! (No object left)")
+                    break # ออกไปรอรับสีใหม่
+                    
+                elif status == 'quit':
+                    return
+                elif status == 'error':
+                    return
+
+    except KeyboardInterrupt:
+        info("Stopped.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        ser.close()
+
+if __name__ == '__main__':
+    main()
